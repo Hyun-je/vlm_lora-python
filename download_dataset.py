@@ -9,6 +9,23 @@ from typing import Optional
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
+from PIL import Image
+Image.MAX_IMAGE_PIXELS = None  # Disable DecompressionBomb warnings
+
+def save_image_safely(image, path):
+    """
+    Safely save image without EXIF handling
+    """
+    try:
+        # Convert to RGB if needed
+        if image.mode not in ('RGB', 'L'):
+            image = image.convert('RGB')
+        # Save without EXIF data
+        image.save(path, format='JPEG', quality=95)
+    except Exception as e:
+        print(f"\nError converting/saving image: {str(e)}")
+        return False
+    return True
 
 def create_robust_session():
     """Create a requests session with retry logic"""
@@ -115,9 +132,14 @@ def download_dataset(
                     image_path = image_dir / f"{example['id']}.jpg"
                     if not image_path.exists():
                         try:
-                            example["image"].save(image_path)
+                            # Get the PIL image
+                            pil_image = example["image"]
+                            # Save image without EXIF data
+                            if not save_image_safely(pil_image, image_path):
+                                print(f"\nSkipping image {example['id']} due to save error")
+                                continue
                         except Exception as e:
-                            print(f"\nError saving image {example['id']}: {str(e)}")
+                            print(f"\nError processing image {example['id']}: {str(e)}")
                             continue
     
     print(f"\nDataset successfully downloaded to {output_path}")
