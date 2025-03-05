@@ -2,7 +2,7 @@ import os
 import json
 import time
 from pathlib import Path
-from datasets import load_dataset
+from datasets import load_dataset, disable_caching
 from tqdm.auto import tqdm
 from functools import partial
 from typing import Optional
@@ -10,22 +10,38 @@ import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from PIL import Image
-Image.MAX_IMAGE_PIXELS = None  # Disable DecompressionBomb warnings
+import io
+import numpy as np
 
-def save_image_safely(image, path):
+# Disable dataset caching
+disable_caching()
+# Disable PIL max image size limit
+Image.MAX_IMAGE_PIXELS = None
+
+def process_and_save_image(image_data, save_path):
     """
-    Safely save image without EXIF handling
+    Process and save image data bypassing EXIF handling
     """
     try:
+        # Convert to numpy array if it's a PIL Image
+        if isinstance(image_data, Image.Image):
+            image_array = np.array(image_data)
+        else:
+            image_array = image_data
+
+        # Create new image from array
+        img = Image.fromarray(image_array)
+        
         # Convert to RGB if needed
-        if image.mode not in ('RGB', 'L'):
-            image = image.convert('RGB')
-        # Save without EXIF data
-        image.save(path, format='JPEG', quality=95)
+        if img.mode not in ('RGB', 'L'):
+            img = img.convert('RGB')
+        
+        # Save without any EXIF data
+        img.save(save_path, format='JPEG', quality=95)
+        return True
     except Exception as e:
-        print(f"\nError converting/saving image: {str(e)}")
+        print(f"\nError saving image: {str(e)}")
         return False
-    return True
 
 def create_robust_session():
     """Create a requests session with retry logic"""
@@ -48,21 +64,14 @@ def download_with_retry(
 ):
     """
     Download dataset with retry logic
-    
-    Args:
-        dataset_name: Name of the dataset on HuggingFace Hub
-        output_dir: Directory to save the dataset
-        cache_dir: Cache directory for huggingface datasets
-        max_retries: Maximum number of retry attempts
-        retry_delay: Delay between retries in seconds
     """
     for attempt in range(max_retries):
         try:
             return load_dataset(
                 dataset_name,
                 cache_dir=cache_dir,
-                num_proc=4,  # Parallel processing
-                verification_mode="no_checks"  # Less strict verification
+                trust_remote_code=True,
+                verification_mode="no_checks"
             )
         except Exception as e:
             if attempt == max_retries - 1:
@@ -77,25 +86,18 @@ def download_dataset(
 ):
     """
     Download dataset and images for offline use with improved error handling.
-    
-    Args:
-        dataset_name: Name of the dataset on HuggingFace Hub
-        output_dir: Directory to save the dataset
-        cache_dir: Cache directory for huggingface datasets
     """
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
     
     print(f"\nDownloading {dataset_name} to {output_path}")
     
-    # Download dataset with retry logic
     try:
         dataset = download_with_retry(dataset_name, output_dir, cache_dir)
     except Exception as e:
         print(f"\nFatal error downloading dataset: {str(e)}")
         raise
     
-    # Save dataset info
     dataset_info = {
         "name": dataset_name,
         "num_rows": len(dataset["train"]),
@@ -106,10 +108,8 @@ def download_dataset(
     with open(output_path / "dataset_info.json", "w", encoding="utf-8") as f:
         json.dump(dataset_info, f, indent=2, ensure_ascii=False)
     
-    # Create robust session for image downloads
     session = create_robust_session()
     
-    # Save each split
     for split in dataset.keys():
         split_dir = output_path / split
         split_dir.mkdir(exist_ok=True)
@@ -121,7 +121,6 @@ def download_dataset(
             print(f"\nError saving {split} split: {str(e)}")
             continue
         
-        # Download and save images if they exist
         if "image" in dataset[split].features:
             image_dir = split_dir / "images"
             image_dir.mkdir(exist_ok=True)
@@ -132,11 +131,9 @@ def download_dataset(
                     image_path = image_dir / f"{example['id']}.jpg"
                     if not image_path.exists():
                         try:
-                            # Get the PIL image
-                            pil_image = example["image"]
-                            # Save image without EXIF data
-                            if not save_image_safely(pil_image, image_path):
-                                print(f"\nSkipping image {example['id']} due to save error")
+                            # Process and save image without EXIF
+                            if not process_and_save_image(example["image"], image_path):
+                                print(f"\nSkipping image {example['id']}")
                                 continue
                         except Exception as e:
                             print(f"\nError processing image {example['id']}: {str(e)}")
