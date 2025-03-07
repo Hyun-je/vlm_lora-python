@@ -23,6 +23,9 @@ def process_and_save_image(image_data, save_path):
     Process and save image data bypassing EXIF handling
     """
     try:
+        # Ensure the directory exists
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        
         # Convert to numpy array if it's a PIL Image
         if isinstance(image_data, Image.Image):
             image_array = np.array(image_data)
@@ -128,15 +131,32 @@ def download_dataset(
             print(f"\nDownloading images for {split} split...")
             for example in tqdm(dataset[split]):
                 if example.get("image"):
-                    image_path = image_dir / f"{example['id']}.jpg"
+                    # Extract image ID and determine subdirectory if needed
+                    img_id = str(example['id'])
+                    
+                    # Check if the ID contains a directory structure (like VG_100K_2/2417991)
+                    if '/' in img_id or '\\' in img_id:
+                        # Normalize the path separator
+                        img_id = img_id.replace('\\', '/') 
+                        # Extract the subdirectory and filename
+                        subdir, filename = os.path.split(img_id)
+                        # Create the full subdirectory path
+                        subdir_path = image_dir / subdir
+                        subdir_path.mkdir(parents=True, exist_ok=True)
+                        # Set the image path with the subdirectory
+                        image_path = subdir_path / f"{filename}.jpg"
+                    else:
+                        # Simple case - just use the ID as the filename
+                        image_path = image_dir / f"{img_id}.jpg"
+                    
                     if not image_path.exists():
                         try:
                             # Process and save image without EXIF
-                            if not process_and_save_image(example["image"], image_path):
-                                print(f"\nSkipping image {example['id']}")
+                            if not process_and_save_image(example["image"], str(image_path)):
+                                print(f"\nSkipping image {img_id}")
                                 continue
                         except Exception as e:
-                            print(f"\nError processing image {example['id']}: {str(e)}")
+                            print(f"\nError processing image {img_id}: {str(e)}")
                             continue
     
     print(f"\nDataset successfully downloaded to {output_path}")
