@@ -1,141 +1,203 @@
-import os
+import sys, os
+import importlib
 import torch
-import logging
-import argparse
 from dataclasses import dataclass, field
-from typing import Optional, Dict, Sequence
-from pathlib import Path
+from transformers import HfArgumentParser
+from transformers import Qwen2_5_VLForConditionalGeneration, Qwen2_5_VLProcessor
+from transformers import BitsAndBytesConfig
+from datasets import load_dataset, concatenate_datasets
+from peft import LoraConfig, get_peft_model
+from trl import SFTConfig, SFTTrainer
+from accelerate import PartialState
 
-import transformers
-from transformers import (
-    AutoTokenizer,
-    AutoModelForCausalLM,
-    HfArgumentParser,
-    TrainingArguments,
-    set_seed,
-)
-from transformers.trainer_utils import get_last_checkpoint
-from peft import (
-    LoraConfig,
-    get_peft_model,
-    prepare_model_for_kbit_training,
-    TaskType,
-)
-from datasets import load_dataset, load_from_disk
-from accelerate import Accelerator
+from model import model_map
+from dataset import dataset_map
 
-logger = logging.getLogger(__name__)
 
 @dataclass
 class ModelArguments:
-    model_name_or_path: str = field(
-        default="lmms-lab/llama3-llava-next-8b",
+    model_name: str = field(
+        default="Qwen/Qwen2.5-VL-7B-Instruct",
         metadata={"help": "Path to pretrained model or identifier from huggingface.co/models"}
     )
-    use_4bit: bool = field(default=True, metadata={"help": "Use 4-bit quantization"})
-    use_nested_quant: bool = field(default=False, metadata={"help": "Use nested quantization"})
-    bnb_4bit_compute_dtype: str = field(default="float16", metadata={"help": "Compute dtype for 4-bit base model"})
-    bnb_4bit_quant_type: str = field(default="nf4", metadata={"help": "Quantization type (fp4 or nf4)"})
-
-@dataclass
-class DataArguments:
-    dataset_name: str = field(
-        default="lmms-lab/LLaVA-NeXT-Data",
-        metadata={"help": "The name of the dataset to use (via the datasets library) or local path"}
-    )
-    dataset_dir: Optional[str] = field(
-        default=None,
-        metadata={"help": "Local directory containing the dataset files"}
-    )
-    max_train_samples: Optional[int] = field(
-        default=None,
-        metadata={"help": "For debugging purposes, truncate the number of training examples."}
+    model_cache_dir: str = field(
+        default="/emb_opt/huggingface_cache/models",
+        metadata={"help": "Cache directory containing the model files"}
     )
 
 @dataclass
 class LoraArguments:
-    lora_rank: int = field(default=64, metadata={"help": "Rank of LoRA matrices"})
-    lora_alpha: int = field(default=16, metadata={"help": "Alpha parameter for LoRA scaling"})
-    lora_dropout: float = field(default=0.1, metadata={"help": "Dropout probability for LoRA layers"})
-    lora_target_modules: str = field(
-        default="q_proj,v_proj,k_proj,o_proj,gate_proj,down_proj,up_proj",
-        metadata={"help": "Comma-separated list of target modules to apply LoRA"}
+    alpha: float = field (
+        default=16,
+        metadata={"help": "Scaling factor for LoRA layers"}
     )
+    dropout: float = field (
+        default=0.05,
+        metadata={"help": "Dropout probability for LoRA layers"}
+    )
+    rank: int = field (
+        default=16,
+        metadata={"help": "Rank of the LoRA matrices"}
+    )
+
+@dataclass
+class DataArguments:
+    dataset_name: list[str] = field(
+        default_factory=list,
+        metadata={"help": "The name of the dataset to use (via the datasets library) or local path"}
+    )
+    dataset_cache_dir: str = field(
+        default="/emb_opt/huggingface_cache/datasets",
+        metadata={"help": "Cache directory containing the dataset files"}
+    )
+
+@dataclass
+class TrainArguments:
+    output_dir: str = field(
+        default="results",
+        metadata={"help": "The name of the dataset to use (via the datasets library) or local path"}
+    )
+    batch_size: int = field(
+        default=1,
+        metadata={"help": "Number of mini batch"}
+    )
+    num_train_epochs: int = field(
+        default=3,
+        metadata={"help": "Number of training epochs"}
+    )
+    report_to: str = field(
+        default="tensorboard",
+        metadata={"help": "tensorboard / wandb"}
+    )
+
+
+
 
 def main():
-    parser = HfArgumentParser((ModelArguments, DataArguments, LoraArguments, TrainingArguments))
-    model_args, data_args, lora_args, training_args = parser.parse_args_into_dataclasses()
 
-    # Setup logging
-    logging.basicConfig(
-        format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
-        datefmt="%m/%d/%Y %H:%M:%S",
-        handlers=[logging.StreamHandler()],
+    os.environ["WANDB_MODE"] = "offline"
+
+    parser = HfArgumentParser((ModelArguments, LoraArguments, DataArguments, TrainArguments))
+    model_args, lora_args, data_args, train_args = parser.parse_args_into_dataclasses()
+
+
+    train_dataset_list = []
+    eval_dataset_list = []
+    for dataset_name in data_args.dataset_name:
+        dataset_module = importlib.import_module(f'dataset.{dataset_map[dataset_name]}')
+        train_dataset, eval_dataset, _ = dataset_module.load(cache_dir=data_args.dataset_cache_dir)
+        print("type(train_dataset)", type(train_dataset))
+        train_dataset_list.append(train_dataset)
+        eval_dataset_list.append(eval_dataset)
+
+    train_dataset = concatenate_datasets(train_dataset_list)
+    eval_dataset = concatenate_datasets(eval_dataset_list)
+
+
+    ### Load the Quantized Model for Training ###
+    model_name = model_map[model_args.model_name]
+    model_module = importlib.import_module(f'model.{model_name}')
+
+
+    # BitsAndBytesConfig int-4 config
+    bnb_config = BitsAndBytesConfig(
+        load_in_4bit=True,
+        bnb_4bit_use_double_quant=True,
+        bnb_4bit_quant_type="nf4",
+        bnb_4bit_compute_dtype=torch.bfloat16
     )
 
-    # Set seed before initializing model
-    set_seed(training_args.seed)
-
-    # Load dataset
-    if data_args.dataset_dir and os.path.exists(os.path.join(data_args.dataset_dir, "train")):
-        logger.info(f"Loading dataset from local directory: {data_args.dataset_dir}")
-        dataset = load_from_disk(os.path.join(data_args.dataset_dir, "train"))
-        dataset = {"train": dataset}
-    else:
-        logger.info(f"Downloading dataset: {data_args.dataset_name}")
-        dataset = load_dataset(data_args.dataset_name)
-    
-    # Load tokenizer and model
-    tokenizer = AutoTokenizer.from_pretrained(
-        model_args.model_name_or_path,
-        trust_remote_code=True,
-    )
-    tokenizer.pad_token = tokenizer.eos_token
-
-    # Load model with quantization
-    model = AutoModelForCausalLM.from_pretrained(
-        model_args.model_name_or_path,
-        torch_dtype=torch.float16,
-        device_map="auto",
-        trust_remote_code=True,
+    model_kwargs = dict(
+        device_map={'':PartialState().process_index},
+        torch_dtype=torch.bfloat16,
+        low_cpu_mem_usage=True,
+        quantization_config=bnb_config,
+        cache_dir=model_args.model_cache_dir
     )
 
-    # Prepare model for k-bit training
-    model = prepare_model_for_kbit_training(model)
+    model, processor, collate_fn = model_module.load(**model_kwargs)
+
+
+    ### Set Up QLoRA and SFTConfig ###
 
     # Configure LoRA
-    lora_target_modules = lora_args.lora_target_modules.split(",")
-    config = LoraConfig(
-        r=lora_args.lora_rank,
-        lora_alpha=lora_args.lora_alpha,
-        target_modules=lora_target_modules,
-        lora_dropout=lora_args.lora_dropout,
+    peft_config = LoraConfig(
+        lora_alpha=lora_args.alpha,
+        lora_dropout=lora_args.dropout,
+        r=lora_args.rank,
         bias="none",
-        task_type=TaskType.CAUSAL_LM,
+        target_modules=[
+            "q_proj",
+            "v_proj",
+            # "k_proj",
+            # "o_proj",
+            # "gate_proj",
+            # "up_proj",
+            # "down_proj"
+        ],
+        task_type="CAUSAL_LM",
     )
 
-    # Get PEFT model
-    model = get_peft_model(model, config)
-    model.print_trainable_parameters()
+    # Apply PEFT model adaptation
+    peft_model = get_peft_model(model, peft_config)
 
-    # Training
-    trainer = transformers.Trainer(
+    # Print trainable parameters
+    peft_model.print_trainable_parameters()
+
+
+
+    # Configure training arguments
+    training_args = SFTConfig(
+        output_dir=train_args.output_dir,  # Directory to save the model
+        num_train_epochs=train_args.num_train_epochs,  # Number of training epochs
+        per_device_train_batch_size=train_args.batch_size,  # Batch size for training
+        per_device_eval_batch_size=train_args.batch_size,  # Batch size for evaluation
+        gradient_accumulation_steps=8,  # Steps to accumulate gradients
+        gradient_checkpointing=True,  # Enable gradient checkpointing for memory efficiency
+        # Optimizer and scheduler settings
+        optim="adamw_torch_fused",  # Optimizer type
+        learning_rate=2e-4,  # Learning rate for training
+        lr_scheduler_type="constant",  # Type of learning rate scheduler
+        # Logging and evaluation
+        logging_steps=10,  # Steps interval for logging
+        eval_steps=100,  # Steps interval for evaluation
+        eval_strategy="steps",  # Strategy for evaluation
+        save_strategy="steps",  # Strategy for saving the model
+        save_steps=100,  # Steps interval for saving
+        metric_for_best_model="eval_loss",  # Metric to evaluate the best model
+        greater_is_better=False,  # Whether higher metric values are better
+        load_best_model_at_end=True,  # Load the best model after training
+        # Mixed precision and gradient settings
+        fp16=True,  # Use bfloat16 precision
+        max_grad_norm=0.3,  # Maximum norm for gradient clipping
+        warmup_ratio=0.03,  # Ratio of total steps for warmup
+        # # Hub and reporting
+        report_to=train_args.report_to,  # Reporting tool for tracking metrics
+        # Gradient checkpointing settings
+        gradient_checkpointing_kwargs={"use_reentrant": False},  # Options for gradient checkpointing
+        # Dataset configuration
+        dataset_text_field="",  # Text field in dataset
+        dataset_kwargs={"skip_prepare_dataset": True},  # Additional dataset options
+        # max_seq_length=1024  # Maximum sequence length for input
+    )
+
+    training_args.remove_unused_columns = False  # Keep unused columns in dataset
+
+
+    trainer = SFTTrainer(
         model=model,
-        train_dataset=dataset["train"],
         args=training_args,
-        data_collator=transformers.DataCollatorForLanguageModeling(tokenizer, mlm=False),
+        train_dataset=train_dataset,
+        eval_dataset=eval_dataset,
+        data_collator=collate_fn,
+        peft_config=peft_config,
+        tokenizer=processor.tokenizer,
     )
 
-    # Start training
-    if training_args.resume_from_checkpoint:
-        checkpoint = training_args.resume_from_checkpoint
-    else:
-        checkpoint = None
+    trainer.train()
 
-    trainer.train(resume_from_checkpoint=checkpoint)
-    
-    # Save model
     trainer.save_model(training_args.output_dir)
+
 
 if __name__ == "__main__":
     main()
